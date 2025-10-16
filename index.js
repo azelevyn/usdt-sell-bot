@@ -6,8 +6,10 @@ const CoinPayments = require('coinpayments');
 
 // --- BOT AND API INITIALIZATION ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
-if (!token) {
-    console.error("FATAL ERROR: TELEGRAM_BOT_TOKEN is not defined in your .env file.");
+const adminChatId = process.env.ADMIN_CHAT_ID;
+
+if (!token || !adminChatId) {
+    console.error("FATAL ERROR: TELEGRAM_BOT_TOKEN or ADMIN_CHAT_ID is not defined in your .env file.");
     process.exit(1);
 }
 
@@ -21,67 +23,71 @@ const coinpaymentsClient = new CoinPayments({
 // --- CONSTANTS AND CONFIGURATION ---
 const MIN_USDT = 25;
 const MAX_USDT = 50000;
+const MARKUP_PERCENTAGE = 1.5; // Your markup: 1.5% above the base rate
 
-// Conversion Rates
-const RATES = {
+// Base Conversion Rates
+const BASE_RATES = {
     USD_TO_USDT: 1.08, // 1 USD = 1.08 USDT
     USD_TO_EUR: 0.89,  // 1 USD = 0.89 EUR
     USDT_TO_GBP: 0.77  // 1 USDT = 0.77 GBP
 };
 
-// Calculate derived rates
-const USDT_TO_USD_RATE = 1 / RATES.USD_TO_USDT;
-const USDT_TO_EUR_RATE = USDT_TO_USD_RATE * RATES.USD_TO_EUR;
+// Calculate final rates with your markup
+const USDT_TO_USD_RATE = (1 / BASE_RATES.USD_TO_USDT) * (1 + MARKUP_PERCENTAGE / 100);
+const USDT_TO_EUR_RATE = USDT_TO_USD_RATE * BASE_RATES.USD_TO_EUR;
+const USDT_TO_GBP_RATE = BASE_RATES.USDT_TO_GBP * (1 + MARKUP_PERCENTAGE / 100);
+
 
 const userSessions = {}; // In-memory storage for user conversation state
 
+// Set the persistent menu button
+bot.setMyCommands([
+    { command: '/start', description: 'Restart the bot' },
+    { command: '/sell', description: 'Sell your USDT' },
+]);
+
 console.log("🚀 USDT Seller Bot is running...");
 
-// --- /start COMMAND HANDLER ---
+// --- COMMAND HANDLERS ---
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    const firstName = msg.from.first_name || '';
-    const lastName = msg.from.last_name || '';
+    const user = msg.from;
+    const firstName = user.first_name || '';
+    const lastName = user.last_name || '';
 
     // Reset any existing session
     delete userSessions[chatId];
 
-    const welcomeText = `Hello **${firstName} ${lastName}**!\n\nWelcome to the USDT Seller Bot. I can help you sell your USDT for fiat currencies like USD, EUR, or GBP. Your funds will be sent directly to your preferred payment method.`;
-    const options = {
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '✅ YES, Sell USDT', callback_data: 'start_sale' }],
-                [{ text: '❌ NO', callback_data: 'cancel_sale' }]
-            ]
-        }
-    };
-    bot.sendMessage(chatId, welcomeText, options);
-    bot.sendMessage(chatId, "Do you want to start the selling process?");
+    // Notify Admin
+    const adminMessage = `🔔 New User Alert!\n\nName: ${firstName} ${lastName}\nUsername: @${user.username || 'N/A'}\nUser ID: ${user.id}`;
+    bot.sendMessage(adminChatId, adminMessage);
+
+    const welcomeText = `Hello **${firstName} ${lastName}**!\n\nWelcome to the USDT Seller Bot. I can help you sell your USDT for fiat currencies.\n\nTo begin, please tap the **/sell** command or select it from the menu.`;
+    
+    bot.sendMessage(chatId, welcomeText, { parse_mode: 'Markdown' });
 });
+
+bot.onText(/\/sell/, (msg) => {
+    startSaleProcess(msg.chat.id);
+});
+
 
 // --- CALLBACK QUERY HANDLER (for button clicks) ---
 bot.on('callback_query', (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
 
-    // Acknowledge the button press
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id); // Acknowledge the button press
 
-    if (data === 'start_sale') {
-        startSaleProcess(chatId);
-    } else if (data === 'cancel_sale') {
-        bot.sendMessage(chatId, "No problem. Feel free to start again whenever you're ready. Just type /start.");
-        delete userSessions[chatId];
-    } else if (userSessions[chatId]) {
-        const stage = userSessions[chatId].stage;
-        if (stage === 'awaiting_fiat' && ['USD', 'EUR', 'GBP'].includes(data)) {
-            handleFiatSelection(chatId, data);
-        } else if (stage === 'awaiting_network' && ['USDT.BEP20', 'USDT.TRC20', 'USDT.ERC20'].includes(data)) {
-            handleNetworkSelection(chatId, data);
-        } else if (stage === 'awaiting_payment_method') {
-            handlePaymentMethodSelection(chatId, data);
-        }
+    if (!userSessions[chatId]) return; // Ignore clicks if session expired
+
+    const stage = userSessions[chatId].stage;
+    if (stage === 'awaiting_fiat' && ['USD', 'EUR', 'GBP'].includes(data)) {
+        handleFiatSelection(chatId, data);
+    } else if (stage === 'awaiting_network' && ['USDT.TRC20', 'USDT.ERC20'].includes(data)) {
+        handleNetworkSelection(chatId, data);
+    } else if (stage === 'awaiting_payment_method') {
+        handlePaymentMethodSelection(chatId, data);
     }
 });
 
@@ -90,9 +96,8 @@ bot.on('callback_query', (query) => {
 bot.on('message', (msg) => {
     const chatId = msg.chat.id;
 
-    // Ignore commands and non-session messages
     if (msg.text.startsWith('/') || !userSessions[chatId]) {
-        return;
+        return; // Ignore commands and non-session messages
     }
 
     const stage = userSessions[chatId].stage;
@@ -109,7 +114,7 @@ bot.on('message', (msg) => {
 function startSaleProcess(chatId) {
     userSessions[chatId] = { stage: 'awaiting_fiat' };
 
-    const ratesText = `Here are the current rates:\n\n*USD to EUR:* \`${RATES.USD_TO_EUR}\`\n*USDT to GBP:* \`${RATES.USDT_TO_GBP}\`\n*USD to USDT:* \`${RATES.USD_TO_USDT}\``;
+    const ratesText = `Here are our current buying rates (including our premium):\n\n*1 USDT ≈ ${USDT_TO_USD_RATE.toFixed(4)} USD*\n*1 USDT ≈ ${USDT_TO_EUR_RATE.toFixed(4)} EUR*\n*1 USDT ≈ ${USDT_TO_GBP_RATE.toFixed(4)} GBP*`;
     bot.sendMessage(chatId, ratesText, { parse_mode: 'Markdown' });
 
     const fiatOptions = {
@@ -129,7 +134,6 @@ function handleFiatSelection(chatId, fiat) {
     const networkOptions = {
         reply_markup: {
             inline_keyboard: [
-                [{ text: 'USDT BEP20 (BSC)', callback_data: 'USDT.BEP20' }],
                 [{ text: 'USDT TRC20 (TRON)', callback_data: 'USDT.TRC20' }],
                 [{ text: 'USDT ERC20 (ETH)', callback_data: 'USDT.ERC20' }]
             ]
@@ -159,7 +163,7 @@ function handleAmountInput(chatId, text) {
     let receivedAmount = 0;
     if (fiat === 'USD') receivedAmount = amount * USDT_TO_USD_RATE;
     if (fiat === 'EUR') receivedAmount = amount * USDT_TO_EUR_RATE;
-    if (fiat === 'GBP') receivedAmount = amount * RATES.USDT_TO_GBP;
+    if (fiat === 'GBP') receivedAmount = amount * USDT_TO_GBP_RATE;
 
     bot.sendMessage(chatId, `You will receive approximately **${receivedAmount.toFixed(2)} ${fiat}**.`, { parse_mode: 'Markdown'});
 
@@ -202,12 +206,10 @@ async function handlePaymentDetailsInput(chatId, details) {
     const { amount, network } = userSessions[chatId];
 
     const transactionOptions = {
-        currency1: network,
-        currency2: network, // Keep this the same as currency1 for crypto deposits
+        currency: network,
         amount: amount,
         buyer_email: process.env.BUYER_REFUND_EMAIL,
         item_name: `Sell ${amount} ${network}`,
-        // Add custom field to link transaction back to user
         custom: JSON.stringify({
             telegramChatId: chatId,
             paymentMethod: userSessions[chatId].paymentMethod,
@@ -219,10 +221,10 @@ async function handlePaymentDetailsInput(chatId, details) {
     try {
         const result = await coinpaymentsClient.createTransaction(transactionOptions);
         
-        const depositInfo = `✅ **Deposit Address Generated!**\n\nPlease send exactly **${result.amount} ${network}** to the following address:\n\n\`${result.address}\`\n\nYour transaction ID is \`${result.txn_id}\`.\n\nOnce your deposit is confirmed, we will process your fiat payment. This transaction will be valid for **${result.timeout / 3600} hours**.`;
+        const depositInfo = `✅ **Deposit Address Generated!**\n\nPlease send exactly **${result.amount} ${network}** to the following address:\n\n\`${result.address}\`\n\nYour transaction ID is \`${result.txn_id}\`.\n\nOnce your deposit is confirmed, we will process your fiat payment. This transaction will be valid for **${(result.timeout / 3600).toFixed(1)} hours**.`;
 
         bot.sendMessage(chatId, depositInfo, { parse_mode: 'Markdown' });
-        // Optionally, send QR code
+
         if (result.qrcode_url) {
             bot.sendPhoto(chatId, result.qrcode_url, { caption: "You can also scan this QR code." });
         }
